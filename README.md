@@ -327,7 +327,3 @@ Users are responsible for compliance with each tool's license terms.
 ## Citation
 
 If you use this pipeline in your research, please cite the relevant tools listed above. Reference data is sourced from the [Broad Institute GCS bucket](https://console.cloud.google.com/storage/browser/gcp-public-data--broad-references) and is subject to [Broad Institute data use terms](https://software.broadinstitute.org/gatk/download/bundle).
-
----
-
-*For detailed setup instructions, see the environment setup guide in the repository.*
