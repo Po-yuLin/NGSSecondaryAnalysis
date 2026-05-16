@@ -1,6 +1,6 @@
 /*
  * =========================================================
- * WGS/WES Germline Analysis Pipeline - Alignment Module
+ * WGS/WES Germline Analysis Pipeline - CNV SV Module
  * =========================================================
  * Author   : Po-Yu Lin (林伯昱)
  * Institute: Department of Neurology and

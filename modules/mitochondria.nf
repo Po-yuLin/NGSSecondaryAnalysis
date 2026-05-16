@@ -1,6 +1,6 @@
 /*
  * =========================================================
- * WGS/WES Germline Analysis Pipeline - Alignment Module
+ * WGS/WES Germline Analysis Pipeline - Mitochondria Module
  * =========================================================
  * Author   : Po-Yu Lin (林伯昱)
  * Institute: Department of Neurology and

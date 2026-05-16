@@ -1,6 +1,6 @@
 /*
  * =========================================================
- * WGS/WES Germline Analysis Pipeline - Alignment Module
+ * WGS/WES Germline Analysis Pipeline - Preprocessing Module
  * =========================================================
  * Author   : Po-Yu Lin (林伯昱)
  * Institute: Department of Neurology and
