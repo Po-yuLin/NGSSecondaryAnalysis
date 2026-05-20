@@ -71,7 +71,7 @@ workflow {
         .fromPath(params.input_csv)
         .splitCsv(header: true)
         .map { row ->
-            def meta  = [id: row.sample, sex: row.sex ?: 'unknown']
+            def meta  = [id: row.sample, sample_id: row.sample, sex: row.sex ?: 'unknown', lane: 'L001']
             def reads = [file(row.fastq_1), file(row.fastq_2)]
             return [meta, reads]
         }
@@ -178,7 +178,18 @@ workflow {
 
     // F. 將基因體切成多個碎塊，平行丟給 GCNV_COHORT 執行
     SCATTER_INTERVALS(FILTER_INTERVALS.out.intervals)
-    ch_scattered_intervals = SCATTER_INTERVALS.out.scattered_lists.flatten()
+
+    // .withIndex() 給每個 shard 一個唯一 index（0, 1, 2...）
+    // 修正 bug：所有 shard 的檔名都叫 scattered.interval_list，
+    // GCNV_COHORT 用 baseName 命名輸出目錄時全部相同，39 個 shard 互相覆蓋
+    // 用 index 確保每個 shard 輸出到不同目錄（gcnv_model_shard_0, _1, ...）
+    // Nextflow channel 不支援 .withIndex()，改用 toList() + flatMap 加 index
+    ch_scattered_intervals = SCATTER_INTERVALS.out.scattered_lists
+        .flatten()
+        .toList()
+        .flatMap { shards ->
+            shards.withIndex().collect { shard, idx -> [idx, shard] }
+        }
 
     GCNV_COHORT(
         ch_scattered_intervals,

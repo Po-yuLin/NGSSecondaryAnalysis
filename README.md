@@ -1,9 +1,9 @@
 # WGS/WES Germline Secondary Analysis Pipeline
 
-A clinical-grade Nextflow DSL2 pipeline for whole-genome and whole-exome sequencing germline variant analysis, developed for the Department of Genomic Medicine, National Cheng Kung University Hospital.
+A clinical-grade Nextflow DSL2 pipeline for whole-genome and whole-exome sequencing germline variant analysis, developed for the Department of Genomic Medicine and Neurology, National Cheng Kung University Hospital.
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Nextflow](https://img.shields.io/badge/nextflow-%E2%89%A523.x-brightgreen)](https://www.nextflow.io/)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Container: Apptainer](https://img.shields.io/badge/container-Apptainer-blue)](https://apptainer.org/)
 
 ---
@@ -39,7 +39,7 @@ FASTQ (R1, R2)
                         ▼
 ┌─────────────────────────────────────────────────────────┐
 │  Step 1 · Alignment (GPU)                               │
-│  Parabricks fq2bam (BWA-MEM2 + BQSR)                    │
+│  Parabricks fq2bam (BWA-MEM2 + BQSR)                   │
 └───────────────────────┬─────────────────────────────────┘
                         │
           ┌─────────────┴─────────────┐

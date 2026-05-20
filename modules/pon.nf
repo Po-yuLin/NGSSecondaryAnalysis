@@ -45,6 +45,9 @@
 // =========================================================
 // GATK: Preprocess & Annotate Intervals (動態支援 WES/WGS)
 // =========================================================
+// =========================================================
+// GATK: Preprocess & Annotate Intervals (動態支援 WES/WGS)
+// =========================================================
 process PREP_GATK_INTERVALS {
     label 'process_low'
 
@@ -284,21 +287,24 @@ process SCATTER_INTERVALS {
 // GATK gCNV: Cohort Model (散佈執行 - WES 高敏感度設定)
 // =========================================================
 process GCNV_COHORT {
+    tag "shard_${shard_idx}"
     label 'process_high'
     publishDir "${params.pon_out_dir}/gcnv_model/shards", mode: 'copy'
 
     input:
-    path interval_shard
+    // shard_idx 由 main_pon.nf 用 .withIndex() 傳入，確保每個 shard 有唯一名稱
+    // 修正前的 bug：所有 shard 的 interval_shard.baseName 都是 "scattered"，
+    // 導致 39 個 task 的輸出目錄全部叫 gcnv_model_shard_scattered，互相覆蓋
+    tuple val(shard_idx), path(interval_shard)
     path counts
     path annotated_intervals
     path ploidy_calls
 
     output:
-    path "gcnv_model_shard_*", emit: model_shard
-    path "gcnv_calls_shard_*", emit: call_shard
+    path "gcnv_model_shard_${shard_idx}", emit: model_shard
+    path "gcnv_calls_shard_${shard_idx}", emit: call_shard
 
     script:
-    def shard_name = interval_shard.baseName
     def counts_args = counts.collect { "-I ${it}" }.join(" \\\n        ")
     """
     gatk --java-options "-Xmx${task.memory.toGiga()-4}g" GermlineCNVCaller \
@@ -311,10 +317,10 @@ process GCNV_COHORT {
         --cnv-coherence-length 1000.0 \
         --class-coherence-length 1000.0 \
         --p-alt 1e-3 \
-        -O gcnv_model_shard_${shard_name} \
-        --output-prefix cohort_${shard_name} \
+        -O gcnv_model_shard_${shard_idx} \
+        --output-prefix cohort_shard_${shard_idx} \
         --verbosity INFO
-        
-    mv gcnv_model_shard_${shard_name}/cohort_${shard_name}-calls gcnv_calls_shard_${shard_name}
+
+    mv gcnv_model_shard_${shard_idx}/cohort_shard_${shard_idx}-calls gcnv_calls_shard_${shard_idx}
     """
 }

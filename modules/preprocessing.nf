@@ -48,7 +48,7 @@ process FASTP {
     // withName 在 config 有個別設定，label 作為 fallback
     label 'process_medium'
 
-    publishDir "${params.out_dir}/${meta.sample_id}/01_preprocessing", mode: 'copy'
+    publishDir "${params.out_dir}/${meta.sample_id ?: meta.id}/01_preprocessing", mode: 'copy'
 
     // INPUT:
     //   meta  - sample metadata map（id, sex）

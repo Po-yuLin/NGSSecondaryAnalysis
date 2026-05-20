@@ -47,7 +47,7 @@ if [[ "${HOSTNAME_SHORT}" == *"dgx"* ]] || [[ "${HOSTNAME_SHORT}" == "dgx2" ]]; 
     export APPTAINER_CACHEDIR="${PIPELINE_BASE}/nextflow_containers"
 
     # GPU lock 清理
-    GPU_LOCK_DIR="/tmp/nxf_gpu_locks"
+    GPU_LOCK_DIR="/raid/DGM/gpu_locks"
     if [ -d "${GPU_LOCK_DIR}" ] && [ -n "$(ls ${GPU_LOCK_DIR} 2>/dev/null)" ]; then
         echo "⚠️  發現殘留的 GPU lock，自動清空..."
         rm -f "${GPU_LOCK_DIR}"/*.lock

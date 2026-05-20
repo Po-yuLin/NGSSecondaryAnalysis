@@ -27,7 +27,7 @@
 # 支援多張：bash gpu_unlock.sh 10,11,12,13,14,15
 
 INPUT="$1"
-GPU_LOCK_DIR="/tmp/nxf_gpu_locks"
+GPU_LOCK_DIR="/raid/DGM/gpu_locks"
 
 # 將逗號分隔的 GPU 清單拆開
 IFS=',' read -ra GPU_LIST <<< "${INPUT}"

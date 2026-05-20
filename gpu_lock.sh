@@ -25,9 +25,9 @@
 # 用法：eval $(bash gpu_lock.sh [N]) → 設定 MY_GPUS 和 CUDA_VISIBLE_DEVICES
 # N：要鎖定的 GPU 數量（預設 1）
  
-GPU_LOCK_DIR="/tmp/nxf_gpu_locks"
+GPU_LOCK_DIR="/raid/DGM/gpu_locks"
 GPU_IDS=(10 11 12 13 14 15)
-MUTEX_FILE="/tmp/nxf_gpu_mutex"
+MUTEX_FILE="/raid/DGM/gpu_locks/nxf_gpu_mutex"
 N="${1:-1}"   # 要一次鎖定的 GPU 數量，預設 1
  
 mkdir -p "${GPU_LOCK_DIR}"
@@ -38,7 +38,7 @@ while true; do
     # 所有 debug 訊息都導向 stderr（>&2），避免污染 RESULT
     RESULT=$(
         flock -x "${MUTEX_FILE}" bash -c "
-            GPU_LOCK_DIR=\"/tmp/nxf_gpu_locks\"
+            GPU_LOCK_DIR=\"/raid/DGM/gpu_locks\"
             GPU_IDS=(10 11 12 13 14 15)
             N=${N}
  
@@ -63,7 +63,7 @@ while true; do
             done
  
             IFS=','; echo \"\${LOCKED[*]}\"
-        " 2>/dev/null
+        "
     )
  
     # RESULT 現在只有一行：逗號分隔的 GPU 清單（如 "10,11"）或 "NONE"
