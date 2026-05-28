@@ -1,6 +1,6 @@
 /*
  * =========================================================
- * WGS/WES Germline Analysis Pipeline - Pon Creation Module
+ * gCNV & CNVkit Panel of Normals (PON) Modules
  * =========================================================
  * Author   : Po-Yu Lin (林伯昱)
  * Institute: Department of Neurology and
@@ -8,27 +8,8 @@
  *            National Cheng Kung University Hospital
  * Contact  : p88124019@gs.ncku.edu.tw
  *
- * Copyright (c) 2026, Po-Yu Lin (林伯昱)
- * 
- *  * This program is free software: you can redistribute it and/or modify
- *  * it under the terms of the GNU General Public License as published by
- *  * the Free Software Foundation, either version 3 of the License, or
- *  * (at your option) any later version.
- *  *
- *  * This program is distributed in the hope that it will be useful,
- *  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- *  * GNU General Public License for more details.
- *  *
- *  * You should have received a copy of the GNU General Public License
- *  * along with this program. If not, see <https://www.gnu.org/licenses/>.
- *  *
- *  * THIRD-PARTY TOOLS NOTICE:
- *  * This pipeline orchestrates third-party tools subject to their own licenses.
- *  * Users of main_research.nf must comply with:
- *  *   - Manta (Illumina): PolyForm Strict License 1.0.0 (non-commercial only)
- *  *   - ExpansionHunter (Illumina): PolyForm Strict License 1.0.0 (non-commercial only)
- *  * See README.md and LICENSE for details.
+ * Copyright (c) 2026, Po-Yu Lin
+ * Licensed under the MIT License
  *
  * DISCLAIMER: This pipeline is provided "as is" without
  * warranty of any kind. The authors and their institution
@@ -42,9 +23,6 @@
  * =========================================================
  */
 
-// =========================================================
-// GATK: Preprocess & Annotate Intervals (動態支援 WES/WGS)
-// =========================================================
 // =========================================================
 // GATK: Preprocess & Annotate Intervals (動態支援 WES/WGS)
 // =========================================================
@@ -197,6 +175,7 @@ process CNVKIT_REFERENCE {
 // =========================================================
 process FILTER_INTERVALS {
     label 'process_medium'
+    publishDir "${params.pon_out_dir}", mode: 'copy'
 
     input:
     path counts
@@ -287,24 +266,21 @@ process SCATTER_INTERVALS {
 // GATK gCNV: Cohort Model (散佈執行 - WES 高敏感度設定)
 // =========================================================
 process GCNV_COHORT {
-    tag "shard_${shard_idx}"
     label 'process_high'
     publishDir "${params.pon_out_dir}/gcnv_model/shards", mode: 'copy'
 
     input:
-    // shard_idx 由 main_pon.nf 用 .withIndex() 傳入，確保每個 shard 有唯一名稱
-    // 修正前的 bug：所有 shard 的 interval_shard.baseName 都是 "scattered"，
-    // 導致 39 個 task 的輸出目錄全部叫 gcnv_model_shard_scattered，互相覆蓋
-    tuple val(shard_idx), path(interval_shard)
+    path interval_shard
     path counts
     path annotated_intervals
     path ploidy_calls
 
     output:
-    path "gcnv_model_shard_${shard_idx}", emit: model_shard
-    path "gcnv_calls_shard_${shard_idx}", emit: call_shard
+    path "gcnv_model_shard_*", emit: model_shard
+    path "gcnv_calls_shard_*", emit: call_shard
 
     script:
+    def shard_name = interval_shard.baseName
     def counts_args = counts.collect { "-I ${it}" }.join(" \\\n        ")
     """
     gatk --java-options "-Xmx${task.memory.toGiga()-4}g" GermlineCNVCaller \
@@ -317,10 +293,10 @@ process GCNV_COHORT {
         --cnv-coherence-length 1000.0 \
         --class-coherence-length 1000.0 \
         --p-alt 1e-3 \
-        -O gcnv_model_shard_${shard_idx} \
-        --output-prefix cohort_shard_${shard_idx} \
+        -O gcnv_model_shard_${shard_name} \
+        --output-prefix cohort_${shard_name} \
         --verbosity INFO
-
-    mv gcnv_model_shard_${shard_idx}/cohort_shard_${shard_idx}-calls gcnv_calls_shard_${shard_idx}
+        
+    mv gcnv_model_shard_${shard_name}/cohort_${shard_name}-calls gcnv_calls_shard_${shard_name}
     """
 }
