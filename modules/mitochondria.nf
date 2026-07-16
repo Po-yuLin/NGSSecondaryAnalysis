@@ -446,7 +446,6 @@ process MITO_FILTER {
     //   fasta/fai/dict       - chrM_only reference + index
     //   blacklist            - 已知 artifact 位點 BED
     //   blacklist_idx        - blacklist BED 的 GATK index（需用 IndexFeatureFile 建立）
-    //   mosdepth_summary     - MOSDEPTH 的 summary.txt reading depth 4.6.2 不再需要了
     input:
     tuple val(meta), path(merged_vcf), path(merged_tbi), path(merged_stats)
     path fasta
@@ -454,7 +453,6 @@ process MITO_FILTER {
     path fasta_dict
     path blacklist
     path blacklist_idx
-    // path mosdepth_summary
 
     // OUTPUT:
     //   vcf - 最終過濾後的 chrM variant VCF（PASS = 可信變異）
@@ -465,7 +463,10 @@ process MITO_FILTER {
     script:
     def avail_mem = task.memory ? (task.memory.toGiga() - 1) : 4
     """
-    # 執行過濾
+    # FilterMutectCalls（mitochondria-mode）＋ 下游 blacklist mask 過濾 NuMT/artifact。
+    # 註：GATK 4.6 的 FilterMutectCalls 已無 --autosomal-coverage（僅舊版有，用於 polymorphic
+    #     NuMT filter）；Broad 現行 mito WDL 也不再使用它。NuMT/artifact 過濾靠 --mitochondria-mode
+    #     ＋ 下方 blacklist mask（已知 NuMT 同源熱區）。
     gatk --java-options "-Xmx${avail_mem}g" FilterMutectCalls \
         -R ${fasta} \
         -V ${merged_vcf} \

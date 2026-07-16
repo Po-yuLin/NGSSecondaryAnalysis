@@ -263,14 +263,17 @@ process SCATTER_INTERVALS {
 }
 
 // =========================================================
-// GATK gCNV: Cohort Model (散佈執行 - WES 高敏感度設定)
+// GATK gCNV: Cohort Model (散佈執行)
+// 超參數由 nextflow_pon.config 提供（貼齊 Broad germline CNV WDL 預設）：
+//   gcnv_p_alt / gcnv_cnv_coherence / gcnv_class_coherence / gcnv_p_active
+// ⚠️ 改動後必須重跑 main_pon.nf 重建 model；敏感度取捨見 CLAUDE.md。
 // =========================================================
 process GCNV_COHORT {
     label 'process_high'
     publishDir "${params.pon_out_dir}/gcnv_model/shards", mode: 'copy'
 
     input:
-    path interval_shard
+    tuple val(idx), path(interval_shard)
     path counts
     path annotated_intervals
     path ploidy_calls
@@ -280,7 +283,9 @@ process GCNV_COHORT {
     path "gcnv_calls_shard_*", emit: call_shard
 
     script:
-    def shard_name = interval_shard.baseName
+    // shard_name 用 channel 傳進來的 index（0,1,2...）。不能用 interval_shard.baseName——
+    // scatter 出來的每個 shard 檔名都是 scattered.interval_list，baseName 全相同會撞名互相覆蓋。
+    def shard_name = idx
     def counts_args = counts.collect { "-I ${it}" }.join(" \\\n        ")
     """
     gatk --java-options "-Xmx${task.memory.toGiga()-4}g" GermlineCNVCaller \
@@ -290,9 +295,10 @@ process GCNV_COHORT {
         --contig-ploidy-calls ${ploidy_calls}/cohort-calls \
         --annotated-intervals ${annotated_intervals} \
         --interval-merging-rule OVERLAPPING_ONLY \
-        --cnv-coherence-length 1000.0 \
-        --class-coherence-length 1000.0 \
-        --p-alt 1e-3 \
+        --cnv-coherence-length ${params.gcnv_cnv_coherence} \
+        --class-coherence-length ${params.gcnv_class_coherence} \
+        --p-alt ${params.gcnv_p_alt} \
+        --p-active ${params.gcnv_p_active} \
         -O gcnv_model_shard_${shard_name} \
         --output-prefix cohort_${shard_name} \
         --verbosity INFO

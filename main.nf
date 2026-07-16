@@ -88,6 +88,7 @@ include { BGZIP_VCF as BGZIP_VCF_DV;
           BCFTOOLS_STATS as BCFTOOLS_STATS_ENSEMBLE;
           MULTIQC }                         from './modules/postprocessing'
 include { AUTOMAP; BCFTOOLS_ROH }           from './modules/roh'
+include { PHASE_COMBINE }                   from './modules/phasing'
 
 if (!params.input_csv) {
     error "錯誤：請提供 --input_csv 參數"
@@ -175,6 +176,8 @@ workflow {
 
     SAMTOOLS_STATS(ch_bam)
     MOSDEPTH(ch_bam, ch_mosdepth_targets, ch_autosome_bed)
+    // (meta, summary.txt)：mito NuMT filter 與 MultiQC 共用同一輸出
+    ch_mosdepth_summary = MOSDEPTH.out.summary
 
     // =========================================================
     // (E) Step 4: Parallel Variant Calling
@@ -373,6 +376,8 @@ workflow {
         ch_mito_merge_input,
         ch_chrM_only_dict
         )
+    // MITO_FILTER：GATK 4.6 的 FilterMutectCalls 已無 --autosomal-coverage，
+    // 不再需要 mosdepth summary（NuMT 過濾靠 --mitochondria-mode + blacklist mask）。
     MITO_FILTER(
         MITO_MERGE.out.vcf,
         ch_chrM_only_fasta, ch_chrM_only_fai, ch_chrM_only_dict,
@@ -383,13 +388,27 @@ workflow {
     // =========================================================
     // (F) Step 5: Post-processing
     // =========================================================
-    // join() 確保同一樣本的 DV 和 HC VCF 配對
-    // 沒有 join 的話，DV 和 HC 執行時間不同，多樣本時會跨樣本錯配
-    ch_ensemble_input = ch_dv_vcf
-        .join(ch_filtered_hc_vcf, by: 0)
-        .map { meta, dv_vcf, dv_tbi, hc_vcf, hc_tbi ->
-            [meta, dv_vcf, dv_tbi, hc_vcf, hc_tbi]
-        }
+    // (選用，--run_phasing，僅 NCKUH) 各 caller 先 phase + combine，再進 ensemble：
+    //   在 merge「之前」、各 caller 還是單樣本 biallelic 時做，SUZ12 這類 del+ins 才
+    //   phase 得到、也才合得成單筆 MNV（merge 後 multiallelic 會讓 whatshap 跳過）。
+    //   非破壞性：產出的 ensemble.fixed 直接帶 phase(PS/|) + 已合成的 compound MNV，
+    //   三級 prepare_vcf 照舊讀 ensemble.fixed 即可。DRAGEN 自帶 PS，其 combine 在三級做。
+    //   預設關閉；在 DGX 驗證後以 --run_phasing true 開啟。
+    if (params.run_phasing) {
+        ch_combine_py = file("${projectDir}/scripts/combine_phased.py")
+        ch_callers = ch_dv_vcf.map { meta, vcf, tbi -> tuple(meta, 'DV', vcf, tbi) }
+            .mix( ch_filtered_hc_vcf.map { meta, vcf, tbi -> tuple(meta, 'HC', vcf, tbi) } )
+        PHASE_COMBINE(ch_callers, ch_bam, ch_fasta, ch_fasta_fai, ch_combine_py)
+
+        ch_dv_ready = PHASE_COMBINE.out.vcf
+            .filter { it[1] == 'DV' }.map { meta, c, vcf, tbi -> tuple(meta, vcf, tbi) }
+        ch_hc_ready = PHASE_COMBINE.out.vcf
+            .filter { it[1] == 'HC' }.map { meta, c, vcf, tbi -> tuple(meta, vcf, tbi) }
+        ch_ensemble_input = ch_dv_ready.join(ch_hc_ready, by: 0)
+    } else {
+        // join() 確保同一樣本的 DV/HC 配對（多樣本非同步完成不會跨樣本錯配）
+        ch_ensemble_input = ch_dv_vcf.join(ch_filtered_hc_vcf, by: 0)
+    }
 
     BCFTOOLS_ENSEMBLE(ch_ensemble_input)
 
@@ -411,7 +430,7 @@ workflow {
         .mix(PARABRICKS_FQ2BAM.out.qc_metrics)
         .mix(SAMTOOLS_STATS.out.stats)
         .mix(MOSDEPTH.out.global_dist)
-        .mix(MOSDEPTH.out.summary)
+        .mix(ch_mosdepth_summary.map { meta, f -> f })
         .mix(BCFTOOLS_STATS.out.stats)
         .mix(BCFTOOLS_STATS_ENSEMBLE.out.stats)
         .collect()
