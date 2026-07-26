@@ -52,43 +52,13 @@ nextflow.enable.dsl = 2
 
 include { FASTP }                           from './modules/preprocessing'
 include { PARABRICKS_FQ2BAM }               from './modules/alignment'
-include { SAMTOOLS_STATS; MOSDEPTH }        from './modules/alignment_qc'
-include { PARABRICKS_DEEPVARIANT;
-          PARABRICKS_HAPLOTYPECALLER;
-          GATK_HAPLOTYPECALLER;
-          GATK_VQSR_SNP;
-          GATK_VQSR_INDEL }                 from './modules/variant_calling'
-include { CNVKIT_BATCH;
-          DELLY_GERMLINE;
-          BCFTOOLS_CONVERT_DELLY;
-          MANTA_GERMLINE;
-          GATK_COLLECT_READ_COUNTS;
-          GATK_PLOIDY_CASE;
-          GATK_GERMLINE_CNV_CASE;
-          GATK_POSTPROCESS_CNV }            from './modules/cnv_sv'
-include { GANGSTR_CHROM;
-          GANGSTR_MERGE;
-          EXPANSIONHUNTER }                from './modules/repeat'
-include { MITO_EXTRACT_READS;
-          MITO_BAM2FASTQ_NORMAL;
-          MITO_BAM2FASTQ_SHIFTED;
-          MITO_BWA_NORMAL;
-          MITO_BWA_SHIFTED;
-          MITO_SORT_MARKDUP as MITO_SORT_INDEX_NORMAL;
-          MITO_SORT_MARKDUP as MITO_SORT_INDEX_SHIFTED;
-          MITO_MUTECT2_NORMAL;
-          MITO_MUTECT2_SHIFTED;
-          MITO_LIFTOVER;
-          MITO_MERGE;
-          MITO_FILTER }                     from './modules/mitochondria'
-include { BGZIP_VCF as BGZIP_VCF_DV;
-          BGZIP_VCF as BGZIP_VCF_HC;
-          BCFTOOLS_ENSEMBLE;
-          BCFTOOLS_STATS;
-          BCFTOOLS_STATS as BCFTOOLS_STATS_ENSEMBLE;
-          MULTIQC }                         from './modules/postprocessing'
-include { AUTOMAP; BCFTOOLS_ROH }           from './modules/roh'
-include { PHASE_COMBINE }                   from './modules/phasing'
+include { ALIGNMENT_QC }                    from './modules/alignment_qc'
+include { CALL_SNV }                        from './modules/call_snv'
+include { CALL_CNV_SV }                     from './modules/cnv_sv'
+include { CALL_STR }                        from './modules/repeat'
+include { CALL_MITO }                       from './modules/call_mito'
+include { MULTIQC }                         from './modules/postprocessing'
+include { CALL_ROH }                        from './modules/roh'
 
 if (!params.input_csv) {
     error "錯誤：請提供 --input_csv 參數"
@@ -164,275 +134,43 @@ workflow {
     ch_bam = PARABRICKS_FQ2BAM.out.alignment_bundle
 
     // =========================================================
-    // (D) Step 3: Alignment QC
+    // (D) Step 3: Alignment QC（sub-workflow：SAMTOOLS_STATS + MOSDEPTH + PLOIDY_CHECK）
     // =========================================================
-    ch_mosdepth_targets = (params.seq_type == "WES") ?
-        file(params.wes_targets) : file("NO_FILE")
-
-    // WGS 深度 QC 只看 autosome primary contig（chr1-22）
-    // 排除 chrM（高拷貝數）、chrX/chrY（受性別影響）、unplaced contig
-    ch_autosome_bed = (params.seq_type == "WGS") ?
-        file(params.autosome_bed) : file("NO_FILE")
-
-    SAMTOOLS_STATS(ch_bam)
-    MOSDEPTH(ch_bam, ch_mosdepth_targets, ch_autosome_bed)
-    // (meta, summary.txt)：mito NuMT filter 與 MultiQC 共用同一輸出
-    ch_mosdepth_summary = MOSDEPTH.out.summary
+    ALIGNMENT_QC(ch_bam)
+    // (meta, summary.txt)：MultiQC 用；PLOIDY_CHECK 在 sub-workflow 內部已消費同一輸出
+    ch_mosdepth_summary = ALIGNMENT_QC.out.summary
 
     // =========================================================
-    // (E) Step 4: Parallel Variant Calling
+    // (E) Step 4-5: SNV/indel calling + ensemble（sub-workflow）
+    //   內含 DeepVariant / HaplotypeCaller / VQSR（各為第二層 sub-workflow）、
+    //   PHASE_COMBINE（--run_phasing）、BCFTOOLS_ENSEMBLE、DV/ensemble stats。
     // =========================================================
+    CALL_SNV(ch_bam)
 
-    // Lane 1: DeepVariant (GPU)
-    PARABRICKS_DEEPVARIANT(ch_bam, ch_fasta, ch_fasta_fai, ch_fasta_dict)
-    BGZIP_VCF_DV(PARABRICKS_DEEPVARIANT.out.vcf)
-    ch_dv_vcf = BGZIP_VCF_DV.out.vcf
+    // Lane 3: CNV / SV（CNVkit(WGS) + Delly + Manta(選) + gCNV(WES)）；CNVkit 用 DeepVariant VCF
+    CALL_CNV_SV(ch_bam, CALL_SNV.out.dv_vcf)
 
-    // Lane 2a: HaplotypeCaller (GPU)
-    // 依賴 DeepVariant 完成後才啟動，確保同一張 GPU 不被同時佔用
-    // join 讓同一個 sample 的 HaplotypeCaller 等 DeepVariant 的 channel 發射後才觸發
-    ch_bam_after_dv = ch_bam
-        .join(BGZIP_VCF_DV.out.vcf.map { meta, vcf, tbi -> [meta, meta.id] })
-        .map { meta, bam, bai, recal, dummy -> [meta, bam, bai, recal] }
+    // Lane 4: STR（GangSTR 依染色體平行化 → 合併；選用 ExpansionHunter）
+    CALL_STR(ch_bam)
 
-    PARABRICKS_HAPLOTYPECALLER(ch_bam_after_dv, ch_fasta, ch_fasta_fai, ch_fasta_dict)
-    BGZIP_VCF_HC(PARABRICKS_HAPLOTYPECALLER.out.vcf)
-    ch_hc_vcf_raw = BGZIP_VCF_HC.out.vcf
-
-    // Lane 2b: VQSR (WGS only)
-    if (params.seq_type == "WGS") {
-        GATK_VQSR_SNP(
-            ch_hc_vcf_raw, 
-            ch_fasta, ch_fasta_fai, ch_fasta_dict,
-            file(params.hapmap),     file("${params.hapmap}.tbi"),
-            file(params.omni),       file("${params.omni}.tbi"),
-            file(params.known_snps), file("${params.known_snps}.tbi"),
-            file(params.dbsnp),      file("${params.dbsnp}.tbi")
-        )
-        GATK_VQSR_INDEL(
-            GATK_VQSR_SNP.out.vcf,
-            ch_fasta, ch_fasta_fai, ch_fasta_dict,
-            file(params.known_indels), file("${params.known_indels}.tbi"),
-            file(params.axiom),        file("${params.axiom}.tbi"),
-            file(params.dbsnp),        file("${params.dbsnp}.tbi")
-        )
-        ch_filtered_hc_vcf = GATK_VQSR_INDEL.out.vcf
-    } else {
-        ch_filtered_hc_vcf = ch_hc_vcf_raw  // ← WES 直接用壓縮後的
-    }
-
-    // Lane 3a: CNVkit (WGS only)
-    if (params.seq_type == "WGS") {
-        ch_cnvkit_pon = params.cnvkit_pon ? file(params.cnvkit_pon) : file("NO_FILE")
-        CNVKIT_BATCH(
-            ch_bam,
-            ch_dv_vcf,
-            ch_fasta,
-            ch_cnvkit_pon
-        )
-    }
-
-    // Lane 3b: Delly SV calling（替代 Manta，BSD license）
-    ch_delly_excl = params.delly_excl ? file(params.delly_excl) : file("NO_FILE")
-    DELLY_GERMLINE(ch_bam, ch_fasta, ch_fasta_fai, ch_delly_excl)
-    BCFTOOLS_CONVERT_DELLY(DELLY_GERMLINE.out.bcf)
-
-    // Lane 3b（選用）: Manta SV calling（--run_manta，預設關閉；非商用授權）
-    if (params.run_manta) {
-        MANTA_GERMLINE(ch_bam, ch_fasta, ch_fasta_fai)
-    }
-
-    // Lane 3c: gCNV (WES only，需 --run_gcnv true 且已有 PON)
-    if (params.seq_type == "WES" && params.run_gcnv) {
-        ch_gcnv_intervals    = file(params.gcnv_pon_dir)
-        ch_ploidy_model      = file(params.gcnv_ploidy_model_dir)
-        ch_model_shards_list = Channel.fromPath("${params.gcnv_model_dir}/**/*-model", type: 'dir').collect()
-        ch_model_shards_flat = Channel.fromPath("${params.gcnv_model_dir}/**/*-model", type: 'dir')
-        
-        GATK_COLLECT_READ_COUNTS(
-            ch_bam, ch_fasta, ch_fasta_fai, ch_fasta_dict,
-            ch_gcnv_intervals
-        )
-        GATK_PLOIDY_CASE(
-            GATK_COLLECT_READ_COUNTS.out.counts,
-            ch_ploidy_model
-        )
-        ch_gcnv_caller_in = GATK_COLLECT_READ_COUNTS.out.counts
-            .join(GATK_PLOIDY_CASE.out.ploidy_calls)
-            .combine(ch_model_shards_flat)
-
-        GATK_GERMLINE_CNV_CASE(ch_gcnv_caller_in)
-
-        ch_postprocess_in = GATK_GERMLINE_CNV_CASE.out.call_shard
-            .groupTuple()
-            .join(GATK_PLOIDY_CASE.out.ploidy_calls)
-
-        GATK_POSTPROCESS_CNV(
-            ch_postprocess_in,
-            ch_model_shards_list,
-            ch_fasta_dict
-        )
-    } else if (params.seq_type == "WGS" && params.run_gcnv) {
-    log.warn "WGS 模式不支援 gCNV，忽略 --run_gcnv 參數"
-    }
-
-    // Lane 4: STR (GangSTR，替代 ExpansionHunter，GPL v3 license)
-    // WGS：按染色體平行化（24 個 process），大幅縮短執行時間
-    // WES：也平行化，但 loci 較少，效果有限
-    def gangstr_regions = params.seq_type == "WES"
-        ? file(params.gangstr_regions_wes)
-        : file(params.gangstr_regions_wgs)
-
-    // 展開 24 個染色體，每個樣本 × 每條染色體 = 一個 GANGSTR_CHROM process
-    def chroms = (1..22).collect { "chr${it}" } + ["chrX", "chrY"]
-    ch_bam_chrom = ch_bam.combine(Channel.from(chroms))
-
-    GANGSTR_CHROM(ch_bam_chrom, ch_fasta, ch_fasta_fai, gangstr_regions)
-
-    // 按樣本收集 24 個 VCF，按染色體順序排序後傳入 GANGSTR_MERGE
-    ch_gangstr_vcfs = GANGSTR_CHROM.out.vcf
-        .map { meta, chrom, vcf -> [meta, chrom, vcf] }
-        .groupTuple(by: 0)
-        .map { meta, chroms_list, vcfs ->
-            // 按染色體順序排序
-            def order = (1..22).collect { "chr${it}" } + ["chrX", "chrY"]
-            def sorted_vcfs = [chroms_list, vcfs].transpose()
-                .sort { a, b -> order.indexOf(a[0]) <=> order.indexOf(b[0]) }
-                .collect { it[1] }
-            [meta, sorted_vcfs]
-        }
-
-    GANGSTR_MERGE(ch_gangstr_vcfs)
-
-    // Lane 4（選用）: ExpansionHunter（--run_expansionhunter，預設關閉；非商用授權）
-    if (params.run_expansionhunter) {
-        EXPANSIONHUNTER(ch_bam, ch_fasta, ch_fasta_fai, file(params.str_catalog))
-    }
-
-    // =========================================================
     // Lane 5: Mitochondria variant calling
-    // =========================================================
-    ch_chrM_only_fasta    = file(params.chrM_only_fasta)
-    ch_chrM_only_fai      = file("${params.chrM_only_fasta}.fai")
-    ch_chrM_only_dict     = file(params.chrM_only_fasta.replace('.fasta', '.dict'))
-    ch_chrM_shifted_fasta = file(params.chrM_shifted_fasta)
-    ch_chrM_shifted_fai   = file("${params.chrM_shifted_fasta}.fai")
-    ch_chrM_shifted_dict  = file(params.chrM_shifted_fasta.replace('.fasta', '.dict'))
-    ch_shift_back         = file(params.chrM_shift_back)
-    ch_chrM_blacklist     = file(params.chrM_blacklist)
+    CALL_MITO(ch_bam)
 
-    MITO_EXTRACT_READS(ch_bam)
-
-    MITO_BAM2FASTQ_NORMAL(MITO_EXTRACT_READS.out.reads)
-    MITO_BWA_NORMAL(
-        MITO_BAM2FASTQ_NORMAL.out.reads,
-        ch_chrM_only_fasta, ch_chrM_only_fai, ch_chrM_only_dict,
-        file("${params.chrM_only_fasta}.amb"),
-        file("${params.chrM_only_fasta}.ann"),
-        file("${params.chrM_only_fasta}.bwt"),
-        file("${params.chrM_only_fasta}.pac"),
-        file("${params.chrM_only_fasta}.sa")
-    )
-    MITO_SORT_INDEX_NORMAL(MITO_BWA_NORMAL.out.bam)
-
-    MITO_BAM2FASTQ_SHIFTED(MITO_EXTRACT_READS.out.reads)
-    MITO_BWA_SHIFTED(
-        MITO_BAM2FASTQ_SHIFTED.out.reads,
-        ch_chrM_shifted_fasta, ch_chrM_shifted_fai, ch_chrM_shifted_dict,
-        file("${params.chrM_shifted_fasta}.amb"),
-        file("${params.chrM_shifted_fasta}.ann"),
-        file("${params.chrM_shifted_fasta}.bwt"),
-        file("${params.chrM_shifted_fasta}.pac"),
-        file("${params.chrM_shifted_fasta}.sa")
-    )
-    MITO_SORT_INDEX_SHIFTED(MITO_BWA_SHIFTED.out.bam)
-
-    MITO_MUTECT2_NORMAL(
-        MITO_SORT_INDEX_NORMAL.out.bam,
-        ch_chrM_only_fasta, ch_chrM_only_fai, ch_chrM_only_dict,
-        ch_chrM_blacklist
-    )
-    MITO_MUTECT2_SHIFTED(
-        MITO_SORT_INDEX_SHIFTED.out.bam,
-        ch_chrM_shifted_fasta, ch_chrM_shifted_fai, ch_chrM_shifted_dict,
-        ch_chrM_blacklist
-    )
-
-    MITO_LIFTOVER(
-        MITO_MUTECT2_SHIFTED.out.vcf,
-        ch_chrM_only_fasta, ch_chrM_only_fai, ch_chrM_only_dict,
-        ch_shift_back
-    )
-    // join() 確保同一個樣本的 normal VCF 和 lifted VCF 配對
-    // 沒有 join 的話，Nextflow 按 queue 順序配對，多樣本非同步完成時會跨樣本錯配
-    ch_mito_merge_input = MITO_MUTECT2_NORMAL.out.vcf
-        .join(MITO_LIFTOVER.out.vcf, by: 0)
-        .map { meta, normal_vcf, normal_tbi, normal_stats,
-                      lifted_vcf, lifted_tbi, lifted_stats ->
-            [meta, normal_vcf, normal_tbi, normal_stats,
-                   lifted_vcf, lifted_tbi, lifted_stats]
-        }
-    MITO_MERGE(
-        ch_mito_merge_input,
-        ch_chrM_only_dict
-        )
-    // MITO_FILTER：GATK 4.6 的 FilterMutectCalls 已無 --autosomal-coverage，
-    // 不再需要 mosdepth summary（NuMT 過濾靠 --mitochondria-mode + blacklist mask）。
-    MITO_FILTER(
-        MITO_MERGE.out.vcf,
-        ch_chrM_only_fasta, ch_chrM_only_fai, ch_chrM_only_dict,
-        ch_chrM_blacklist,
-        file("${params.chrM_blacklist}.idx")
-    )
+    // Lane 6: ROH（sub-workflow：bcftools roh + AutoMap，皆選用、預設關閉；ROH 不納入評鑑）
+    //   用 HaplotypeCaller raw VCF（保留 GT/AD）；flag 收在 CALL_ROH 內部。
+    CALL_ROH(CALL_SNV.out.hc_vcf_raw)
 
     // =========================================================
-    // (F) Step 5: Post-processing
+    // (F) MultiQC 匯總
     // =========================================================
-    // (選用，--run_phasing，僅 NCKUH) 各 caller 先 phase + combine，再進 ensemble：
-    //   在 merge「之前」、各 caller 還是單樣本 biallelic 時做，SUZ12 這類 del+ins 才
-    //   phase 得到、也才合得成單筆 MNV（merge 後 multiallelic 會讓 whatshap 跳過）。
-    //   非破壞性：產出的 ensemble.fixed 直接帶 phase(PS/|) + 已合成的 compound MNV，
-    //   三級 prepare_vcf 照舊讀 ensemble.fixed 即可。DRAGEN 自帶 PS，其 combine 在三級做。
-    //   預設關閉；在 DGX 驗證後以 --run_phasing true 開啟。
-    if (params.run_phasing) {
-        ch_combine_py = file("${projectDir}/scripts/combine_phased.py")
-        ch_callers = ch_dv_vcf.map { meta, vcf, tbi -> tuple(meta, 'DV', vcf, tbi) }
-            .mix( ch_filtered_hc_vcf.map { meta, vcf, tbi -> tuple(meta, 'HC', vcf, tbi) } )
-        PHASE_COMBINE(ch_callers, ch_bam, ch_fasta, ch_fasta_fai, ch_combine_py)
-
-        ch_dv_ready = PHASE_COMBINE.out.vcf
-            .filter { it[1] == 'DV' }.map { meta, c, vcf, tbi -> tuple(meta, vcf, tbi) }
-        ch_hc_ready = PHASE_COMBINE.out.vcf
-            .filter { it[1] == 'HC' }.map { meta, c, vcf, tbi -> tuple(meta, vcf, tbi) }
-        ch_ensemble_input = ch_dv_ready.join(ch_hc_ready, by: 0)
-    } else {
-        // join() 確保同一樣本的 DV/HC 配對（多樣本非同步完成不會跨樣本錯配）
-        ch_ensemble_input = ch_dv_vcf.join(ch_filtered_hc_vcf, by: 0)
-    }
-
-    BCFTOOLS_ENSEMBLE(ch_ensemble_input)
-
-    // ROH（選用，皆預設關閉；ROH 不納入評鑑）：用 HaplotypeCaller VCF（保留 GT/AD）。
-    //   --run_roh     → bcftools roh（MIT/GPL，可商用）
-    //   --run_automap → AutoMap（無公開授權，僅非商用/研究）
-    if (params.run_roh) {
-        BCFTOOLS_ROH(ch_hc_vcf_raw)
-    }
-    if (params.run_automap) {
-        AUTOMAP(ch_hc_vcf_raw)
-    }
-
-    BCFTOOLS_STATS(ch_dv_vcf)
-    BCFTOOLS_STATS_ENSEMBLE(BCFTOOLS_ENSEMBLE.out.vcf)
-
     ch_multiqc = Channel.empty()
         .mix(FASTP.out.json)
         .mix(PARABRICKS_FQ2BAM.out.qc_metrics)
-        .mix(SAMTOOLS_STATS.out.stats)
-        .mix(MOSDEPTH.out.global_dist)
+        .mix(ALIGNMENT_QC.out.stats)
+        .mix(ALIGNMENT_QC.out.global_dist)
         .mix(ch_mosdepth_summary.map { meta, f -> f })
-        .mix(BCFTOOLS_STATS.out.stats)
-        .mix(BCFTOOLS_STATS_ENSEMBLE.out.stats)
+        .mix(CALL_SNV.out.dv_stats)
+        .mix(CALL_SNV.out.ensemble_stats)
         .collect()
 
     MULTIQC(ch_multiqc)

@@ -111,3 +111,73 @@ process MOSDEPTH {
         ${bam}
     """
 }
+
+
+// ──────────────────────────────────────────────────────────────
+// PLOIDY_CHECK：從 mosdepth summary 推 sex/ploidy（sex 防呆 + aneuploidy 提示）。
+//   warn-only：只印警示 + 出 QC 檔，不改 ploidy、不讓 pipeline 失敗。
+//   輸出（對齊 DRAGEN *.ploidy.vcf.gz 風格）：
+//     - <id>.ploidy.vcf.gz ：每條 contig 一列 FORMAT=DC:NDC，header 帶 estimated/declared 核型
+//     - <id>.ploidy_qc.txt ：人可讀摘要 + WARNINGS
+//   ploidy_check.py 以 staged path input 傳入（content-hash → 改 script 後 -resume 正確重跑）。
+// ──────────────────────────────────────────────────────────────
+process PLOIDY_CHECK {
+
+    tag "${meta.id}"
+
+    publishDir "${params.out_dir}/${meta.id}/03_alignment_qc", mode: 'copy'
+
+    input:
+    tuple val(meta), path(summary)
+    path ploidy_py
+
+    output:
+    tuple val(meta),
+          path("${meta.id}.ploidy.vcf.gz"),
+          path("${meta.id}.ploidy_qc.txt"), emit: ploidy
+
+    script:
+    """
+    python3 ${ploidy_py} \
+        --summary ${summary} \
+        --sample ${meta.id} \
+        --declared-sex ${meta.sex} \
+        --seq-type ${params.seq_type} \
+        --out-vcf ${meta.id}.ploidy.vcf \
+        --out-qc ${meta.id}.ploidy_qc.txt
+    # 對齊 DRAGEN 的 *.ploidy.vcf.gz（用 bcftools 壓縮；tertiary_python 容器含 bcftools）
+    bcftools view ${meta.id}.ploidy.vcf -Oz -o ${meta.id}.ploidy.vcf.gz
+    rm -f ${meta.id}.ploidy.vcf
+    """
+}
+
+
+// ──────────────────────────────────────────────────────────────
+// ALIGNMENT_QC sub-workflow（Step 3）：SAMTOOLS_STATS + MOSDEPTH + PLOIDY_CHECK。
+//   對外只吃 bam_ch；mosdepth targets / autosome BED / ploidy_check.py 於內部依 params 建立。
+//   emit MultiQC 需要的 stats / summary / global_dist，及 ploidy QC 輸出。
+// ──────────────────────────────────────────────────────────────
+workflow ALIGNMENT_QC {
+    take:
+    bam_ch      // tuple(meta, bam, bai, ...)
+
+    main:
+    ch_mosdepth_targets = (params.seq_type == "WES") ?
+        file(params.wes_targets) : file("NO_FILE")
+    // WGS 深度 QC 只看 autosome primary contig（chr1-22）；排除 chrM/chrX/chrY/unplaced
+    ch_autosome_bed = (params.seq_type == "WGS") ?
+        file(params.autosome_bed) : file("NO_FILE")
+    ch_ploidy_py = file("${projectDir}/scripts/ploidy_check.py")
+
+    SAMTOOLS_STATS(bam_ch)
+    MOSDEPTH(bam_ch, ch_mosdepth_targets, ch_autosome_bed)
+    PLOIDY_CHECK(MOSDEPTH.out.summary, ch_ploidy_py)
+
+    emit:
+    stats       = SAMTOOLS_STATS.out.stats
+    summary     = MOSDEPTH.out.summary      // mito NuMT filter 與 MultiQC 共用
+    global_dist = MOSDEPTH.out.global_dist
+    thresholds  = MOSDEPTH.out.thresholds
+    regions     = MOSDEPTH.out.regions
+    ploidy      = PLOIDY_CHECK.out.ploidy
+}

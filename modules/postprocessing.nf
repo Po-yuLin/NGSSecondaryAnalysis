@@ -81,6 +81,8 @@ process BCFTOOLS_ENSEMBLE {
     tuple val(meta),
         path(dv_vcf), path(dv_tbi),
         path(hc_vcf), path(hc_tbi)
+    // 性別感知倍體定義（單一真相來源；params.sex_ploidy_file，staged）
+    path ploidy_file
         
     // OUTPUT:
     //   vcf - 兩個 caller 合併且校正過 ploidy後的 ensemble VCF（含 SOURCE INFO tag，2 samples）
@@ -108,20 +110,46 @@ process BCFTOOLS_ENSEMBLE {
     echo "${prefix} ${prefix}_DV" > rename_dv.txt
     echo "${prefix} ${prefix}_HC" > rename_hc.txt
 
-    bcftools reheader -s rename_dv.txt ${dv_vcf} -o temp_dv.vcf.gz
-    bcftools index --tbi temp_dv.vcf.gz
-    
-    bcftools reheader -s rename_hc.txt ${hc_vcf} -o temp_hc.vcf.gz
-    bcftools index --tbi temp_hc.vcf.gz
+    bcftools reheader -s rename_dv.txt ${dv_vcf} -o rn_dv.vcf.gz
+    bcftools reheader -s rename_hc.txt ${hc_vcf} -o rn_hc.vcf.gz
 
     # -------------------------------------------------------------
-    # 2. 執行聯集合併 (Union)
+    # 2. 統一 FORMAT/AD header 為 Number=R → 各自拆 biallelic → 聯集合併 (Union)
     # -------------------------------------------------------------
+    # 根因：DeepVariant 與 HaplotypeCaller 對 FORMAT/AD 的 header Number 定義「不一致」
+    #   （bcftools 警告 "combine AD tag definitions of different lengths"）。只要有一邊不是
+    #   Number=R，bcftools norm/merge 就無法把 AD 依 allele 正確拆分/重排：
+    #     - 拆 multiallelic 時，非 R 的 AD 不會被 re-size → biallelic 卻帶多個 AD 值
+    #       （NA12878 chr1:111241360：2 alleles 卻 3 個 AD → merge 失敗）；
+    #     - 直接合併時 AD 沒依新 ALT union 補齊 → 三級 norm 報 "wrong number of fields"
+    #       （VAL-55 chr1:83829）。
+    #   解法：合併前先把兩邊 header 的 AD 強制成 Number=R（AD 本就是 per-allele），之後
+    #   norm -m -any 才會正確 re-size、merge 也不再衝突。sed 對 ID=AD 那行不論原本
+    #   Number 是 . / 數字 / R 一律改 R（已是 R 則無副作用）。
+    # 一併把 PL 補成 Number=G（同理，PL 本就是 per-genotype；DV/HC 若對 PL 也定義不一致，
+    # 會在 AD 修好後換 PL 報同類錯。已是 G / 無 PL 行則無副作用）。
+    bcftools view -h rn_dv.vcf.gz \\
+        | sed 's/##FORMAT=<ID=AD,Number=[^,]*,/##FORMAT=<ID=AD,Number=R,/' \\
+        | sed 's/##FORMAT=<ID=PL,Number=[^,]*,/##FORMAT=<ID=PL,Number=G,/' > hdr_dv.txt
+    bcftools reheader -h hdr_dv.txt rn_dv.vcf.gz -o fx_dv.vcf.gz
+    bcftools view -h rn_hc.vcf.gz \\
+        | sed 's/##FORMAT=<ID=AD,Number=[^,]*,/##FORMAT=<ID=AD,Number=R,/' \\
+        | sed 's/##FORMAT=<ID=PL,Number=[^,]*,/##FORMAT=<ID=PL,Number=G,/' > hdr_hc.txt
+    bcftools reheader -h hdr_hc.txt rn_hc.vcf.gz -o fx_hc.vcf.gz
+
+    # 各自拆成 biallelic（AD 已是 Number=R，會被正確 re-size），再走 bcftools 標準的
+    # biallelic→multiallelic 聯集路徑（Number=R/A/G 正確處理；某 caller 缺的 allele 補 '.'）。
+    # phasing 開啟時，combine_phased.py 產生的 MNV / 1|2 記錄也在此一併拆開。
+    bcftools norm -m -any fx_dv.vcf.gz -O z -o temp_dv.vcf.gz
+    bcftools index --tbi temp_dv.vcf.gz
+    bcftools norm -m -any fx_hc.vcf.gz -O z -o temp_hc.vcf.gz
+    bcftools index --tbi temp_hc.vcf.gz
+
     bcftools merge \\
         --merge all \\
         -O z -o ${prefix}.ensemble.raw.vcf.gz \\
         temp_dv.vcf.gz temp_hc.vcf.gz
-        
+
     bcftools index --tbi ${prefix}.ensemble.raw.vcf.gz
 
     # -------------------------------------------------------------
@@ -131,33 +159,28 @@ process BCFTOOLS_ENSEMBLE {
     echo "${prefix}_DV ${sex}" > sample_sex.txt
     echo "${prefix}_HC ${sex}" >> sample_sex.txt
 
-    # B. 建立 hg38 的倍體定義檔 (Ploidy Map)
-    # 定義男性 (M) 的 chrX 非 PAR 區和 chrY 為單倍體 (1)，其餘皆為二倍體 (2)
-    # (1-10000 是 N，所以從 1 開始寫也沒差，結尾精準對齊你的 2781479)
-    cat <<EOF > hg38_ploidy.txt
-chrX 1 2781479 M 2
-chrX 2781480 155701382 M 1
-chrX 155701383 156030895 M 2
-chrX 156030896 156040895 M 1
-chrY 1 57227415 M 1
-chrX 1 156040895 F 2
-chrM 1 16569 * 1
-* * * * 2
-EOF
+    # B. 倍體定義檔 (Ploidy Map) 改由 config 的 params.sex_ploidy_file 傳入（單一真相來源，
+    #    格式 CHROM FROM TO SEX PLOIDY，GRCh38 PAR 座標）。以 staged input 進來，見上方 input。
 
     # -------------------------------------------------------------
     # 4. 執行 bcftools +fixploidy 進行優雅校正
     # -------------------------------------------------------------
     bcftools +fixploidy ${prefix}.ensemble.raw.vcf.gz \\
         -O z -o ${prefix}.ensemble.fixed.vcf.gz \\
-        -- -s sample_sex.txt -p hg38_ploidy.txt
+        -- -s sample_sex.txt -p ${ploidy_file}
 
     bcftools index --tbi ${prefix}.ensemble.fixed.vcf.gz
-    
+
     # -------------------------------------------------------------
-    # 5. 清理所有暫存檔
+    # 5. 發布前 preflight：確認 ensemble 可在「不用 --force」下通過 norm -m
+    #    （Number=R/A/G 欄位數正確）。壞掉就讓二級 fail loud，不把壞檔丟給三級（見回報 §8）。
     # -------------------------------------------------------------
-    rm -f rename_dv.txt rename_hc.txt temp_dv.vcf.gz* temp_hc.vcf.gz* sample_sex.txt hg38_ploidy.txt ${prefix}.ensemble.raw.vcf.gz*
+    bcftools norm -m -any ${prefix}.ensemble.fixed.vcf.gz -O u -o /dev/null
+
+    # -------------------------------------------------------------
+    # 6. 清理所有暫存檔
+    # -------------------------------------------------------------
+    rm -f rename_dv.txt rename_hc.txt rn_dv.vcf.gz* rn_hc.vcf.gz* hdr_dv.txt hdr_hc.txt fx_dv.vcf.gz* fx_hc.vcf.gz* temp_dv.vcf.gz* temp_hc.vcf.gz* sample_sex.txt ${prefix}.ensemble.raw.vcf.gz*
     """
     // # -------------------------------------------------------------
     // # 方案 B：嚴格取交集 (Intersection) -> 產出 1 個 Sample 欄位的 VCF
