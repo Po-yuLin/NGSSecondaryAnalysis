@@ -83,7 +83,9 @@ process BCFTOOLS_ENSEMBLE {
         path(hc_vcf), path(hc_tbi)
     // 性別感知倍體定義（單一真相來源；params.sex_ploidy_file，staged）
     path ploidy_file
-        
+    // 男性單倍體區 het 的前處理（scripts/haploid_het.awk，staged → 內容改了 -resume 會重跑）
+    path haploid_awk
+
     // OUTPUT:
     //   vcf - 兩個 caller 合併且校正過 ploidy後的 ensemble VCF（含 SOURCE INFO tag，2 samples）
     output:
@@ -140,7 +142,32 @@ process BCFTOOLS_ENSEMBLE {
     # 各自拆成 biallelic（AD 已是 Number=R，會被正確 re-size），再走 bcftools 標準的
     # biallelic→multiallelic 聯集路徑（Number=R/A/G 正確處理；某 caller 缺的 allele 補 '.'）。
     # phasing 開啟時，combine_phased.py 產生的 MNV / 1|2 記錄也在此一併拆開。
-    bcftools norm -m -any fx_dv.vcf.gz -O z -o temp_dv.vcf.gz
+    #
+    # ⚠️ DV arm 拆完後只留「DV 真的有 ALT call」的紀錄（-i 'GT="alt"'），再進 merge。
+    #   DeepVariant 的 VCF 會保留它考慮過但否決的候選（FILTER=RefCall，GT ./. 或 0/0）。
+    #   若讓它們進 merge --merge all，只要 HC 在同一 POS 有不同 allele，兩者就會被併成
+    #   一筆多等位紀錄 —— ALT1 是 DV 否決的候選、ALT2 是 HC 真正的 call —— 而且合併後的
+    #   FILTER 會變成 DV 的 RefCall。三級 norm 再拆開時，被否決的那個 allele 會變成一筆
+    #   「兩邊都沒 call」的獨立紀錄。
+    #   實例（SUZ12 chr17:31998950）：DV 把 delinsTT 的三個片段（GAAA>GAA、952 A>T、
+    #   953 A>T）全判 RefCall；HC 經 combine_phased 正確合成 GAAA>GTT（0|1）。merge 後
+    #   變成 GAAA  GAA,GTT、FILTER=RefCall，三級拆開後報告多出錯誤的 c.2170del，且正確的
+    #   delinsTT 帶著 DV 的 AD「10,0」（DV 從未評估過這個 allele）。
+    #   先 norm 再 filter 的順序是必要的：DV 的多等位 0/2 拆開後是 0/0（被否決的 ALT）+
+    #   0/1（真的 call），這樣才能只丟掉被否決的那個 allele。
+    #   GT="alt" 的實測語義（bcftools）：保留 0/1、0|1、1/1、1|1、1/0；丟掉 ./.、0/0、0|0、
+    #   ./0，以及半缺失的 ./1、1/. —— 與三級 add_callers_tag.is_called()（任一 allele 缺失
+    #   即視為沒 call）一致。DV 本身不產生半缺失 GT。
+    #   RefCall 仍完整保留在已發布的 <id>.deepvariant.vcf.gz（BGZIP_VCF_DV），可供稽核；
+    #   CNVkit 的 b-allele 輸入讀的也是那份原始 DV VCF，不受影響。
+    #   HC 不需要同樣處理：HC 的 VCF 模式只輸出有 ALT 的位點。
+    #   這裡擋不到 combine_phased.py 合成的紀錄（它的 GT 是重建的、帶 ALT）。舊版 combine
+    #   會把被否決的較寬候選挑成 anchor，合成紀錄因此帶著 FILTER=RefCall 與它的 AD/VAF 留下來
+    #   （VAL55：28,050 筆）；已在 combine_phased.py 修正（沒有 ALT 的紀錄不參與叢集）。
+    #   不用 pipe：本 pipeline 的 shell 是 bash -ue（沒有 pipefail），norm 若中途失敗，
+    #   接在後面的 view 仍可能以 0 結束並寫出截斷的檔案。拆成兩步，各自被 -e 檢查。
+    bcftools norm -m -any fx_dv.vcf.gz -O u -o norm_dv.bcf
+    bcftools view -i 'GT="alt"' norm_dv.bcf -O z -o temp_dv.vcf.gz
     bcftools index --tbi temp_dv.vcf.gz
     bcftools norm -m -any fx_hc.vcf.gz -O z -o temp_hc.vcf.gz
     bcftools index --tbi temp_hc.vcf.gz
@@ -163,9 +190,35 @@ process BCFTOOLS_ENSEMBLE {
     #    格式 CHROM FROM TO SEX PLOIDY，GRCh38 PAR 座標）。以 staged input 進來，見上方 input。
 
     # -------------------------------------------------------------
+    # 3.5 男性單倍體區的 het（只對男性；在 +fixploidy 之前）
+    # -------------------------------------------------------------
+    # +fixploidy 把男性 chrX 非 PAR / chrY 的 GT 改成單套時「只留第一個 allele」：
+    #   0/1、0|1 → 0（變 REF，報告看不到）；1|0 → 1（hemizygous）。開了 phasing 之後，
+    #   同樣是 het，結果取決於 whatshap 任意定的 phase 方向（VAL55：chrX 2,607 筆 + chrY 6,049 筆
+    #   被截成 REF 而消失，另有數百筆 phase 過的 het 被顯示成 hemizygous）。
+    # 男性的 het 多半是比對假象，但也可能是 47,XXY 或體細胞嵌合 —— X-linked 顯性、男性通常致死的
+    #   疾病（IKBKG、MECP2、CDKL5、PORCN、OFD1…）存活的男性病人常是嵌合；PCDH19 則是嵌合男性才
+    #   發病。所以不能一律藏掉，也不能讓 phase 方向決定。
+    # haploid_het.awk（讀同一份 ploidy 檔）：
+    #   chrX 非 PAR：het 0/k → k/k，INFO 加 HAPLOID_HET=<DV,HC> → 截斷後一律保留 ALT，
+    #     三級報告的 HAPLOID_HET 欄提示人工複核；AD/VAF 原封不動，判讀者可看比例。
+    #   chrY：het → ./.（不進報告；chrY 的 het 幾乎都是比對假象）。chrM 不處理。
+    # 用 subshell + pipefail：本 pipeline 的 shell 是 bash -ue（沒有 pipefail），直接接 pipe 的話
+    #   上游失敗會被吞掉；subshell 讓 pipefail 只作用在這一段。
+    FIX_IN=${prefix}.ensemble.raw.vcf.gz
+    if [ "${sex}" = "M" ]; then
+        command -v awk >/dev/null || { echo "[BCFTOOLS_ENSEMBLE] awk not found in container" >&2; exit 1; }
+        ( set -o pipefail
+          bcftools view ${prefix}.ensemble.raw.vcf.gz \\
+            | awk -v SEX=M -f ${haploid_awk} ${ploidy_file} - \\
+            | bcftools view -O z -o ${prefix}.ensemble.hh.vcf.gz - )
+        FIX_IN=${prefix}.ensemble.hh.vcf.gz
+    fi
+
+    # -------------------------------------------------------------
     # 4. 執行 bcftools +fixploidy 進行優雅校正
     # -------------------------------------------------------------
-    bcftools +fixploidy ${prefix}.ensemble.raw.vcf.gz \\
+    bcftools +fixploidy \$FIX_IN \\
         -O z -o ${prefix}.ensemble.fixed.vcf.gz \\
         -- -s sample_sex.txt -p ${ploidy_file}
 
@@ -180,7 +233,7 @@ process BCFTOOLS_ENSEMBLE {
     # -------------------------------------------------------------
     # 6. 清理所有暫存檔
     # -------------------------------------------------------------
-    rm -f rename_dv.txt rename_hc.txt rn_dv.vcf.gz* rn_hc.vcf.gz* hdr_dv.txt hdr_hc.txt fx_dv.vcf.gz* fx_hc.vcf.gz* temp_dv.vcf.gz* temp_hc.vcf.gz* sample_sex.txt ${prefix}.ensemble.raw.vcf.gz*
+    rm -f rename_dv.txt rename_hc.txt rn_dv.vcf.gz* rn_hc.vcf.gz* hdr_dv.txt hdr_hc.txt fx_dv.vcf.gz* fx_hc.vcf.gz* norm_dv.bcf temp_dv.vcf.gz* temp_hc.vcf.gz* sample_sex.txt ${prefix}.ensemble.raw.vcf.gz* ${prefix}.ensemble.hh.vcf.gz
     """
     // # -------------------------------------------------------------
     // # 方案 B：嚴格取交集 (Intersection) -> 產出 1 個 Sample 欄位的 VCF
